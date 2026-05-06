@@ -91,10 +91,12 @@ class TradeDecision:
 
                 atr = self.compute_atr(highs, lows, closes)
 
-                # Position size baseado em risco fixo
+                # Position size baseado em risco fixo (capped pelo saldo spot)
                 risk_usdt = usdt_balance * RISK_PERCENT
                 sl_distance = SL_ATR * atr
-                position_size = risk_usdt / sl_distance if sl_distance > 0 else 0
+                raw_size = risk_usdt / sl_distance if sl_distance > 0 else 0
+                max_qty = usdt_balance / current_price if current_price > 0 else 0
+                position_size = min(raw_size, max_qty)
 
                 # Arredonda para precisao da Binance
                 precision = 8  # default
