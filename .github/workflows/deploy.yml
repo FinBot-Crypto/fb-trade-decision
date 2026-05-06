@@ -28,7 +28,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/fb-trade-decision:latest
+          tags: ghcr.io/finbot-crypto/fb-trade-decision:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
