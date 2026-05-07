@@ -16,11 +16,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("fb-trade-decision")
 
 NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.05"))  # 5% do capital por trade
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.05"))  # 100% = todo saldo distribuído
 SL_ATR = float(os.getenv("SL_ATR", "2.0"))
 TP_ATR = float(os.getenv("TP_ATR", "4.0"))
 ATR_PERIOD = 14
-MIN_SIZE_USDT = float(os.getenv("MIN_SIZE_USDT", "15.0"))  # tamanho minimo da posicao
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "20"))
+MIN_SIZE_USDT = float(os.getenv("MIN_SIZE_USDT", "5.0"))  # tamanho minimo da posicao
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -91,12 +92,11 @@ class TradeDecision:
 
                 atr = self.compute_atr(highs, lows, closes)
 
-                # Position size baseado em risco fixo (capped pelo saldo spot)
-                risk_usdt = usdt_balance * RISK_PERCENT
-                sl_distance = SL_ATR * atr
-                raw_size = risk_usdt / sl_distance if sl_distance > 0 else 0
-                max_qty = usdt_balance / current_price if current_price > 0 else 0
-                position_size = min(raw_size, max_qty)
+                # Exposição total = saldo × RISK_PERCENT, distribuída igualmente
+                exposed_capital = usdt_balance * RISK_PERCENT
+                notional_per_trade = max(MIN_SIZE_USDT, exposed_capital / MAX_POSITIONS) if MAX_POSITIONS > 0 else exposed_capital
+                position_size = notional_per_trade / current_price if current_price > 0 else 0
+                risk_usdt = position_size * atr * SL_ATR  # risco real baseado no ATR
 
                 # Arredonda para precisao da Binance
                 precision = 8  # default
@@ -113,7 +113,7 @@ class TradeDecision:
                     logger.info(f"  {symbol}: size={position_size} ({position_size*current_price:.1f} USDT) < min → ignora")
                     continue
 
-                sl_price = round(current_price - sl_distance, 4)
+                sl_price = round(current_price - SL_ATR * atr, 4)
                 tp_price = round(current_price + TP_ATR * atr, 4)
 
                 order = {
