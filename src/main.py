@@ -98,16 +98,15 @@ class TradeDecision:
                 position_size = notional_per_trade / current_price if current_price > 0 else 0
                 risk_usdt = position_size * atr * SL_ATR  # risco real baseado no ATR
 
-                # Arredonda para precisao da Binance
-                precision = 8  # default
+                # Arredonda e garante minimo da Binance
                 try:
-                    market = self.exchange.market(symbol)
-                    if market and "precision" in market:
-                        precision = int(market["precision"]["amount"])
+                    min_qty = self.exchange.market(symbol)["limits"]["amount"]["min"]
+                    position_size_str = self.exchange.amount_to_precision(symbol, position_size)
+                    position_size = float(position_size_str)
+                    if position_size < min_qty:
+                        position_size = min_qty  # garante pelo menos 1 unidade minima
                 except Exception:
                     pass
-
-                position_size = round(position_size, precision)
 
                 if position_size * current_price < MIN_SIZE_USDT:
                     logger.info(f"  {symbol}: size={position_size} ({position_size*current_price:.1f} USDT) < min → ignora")
