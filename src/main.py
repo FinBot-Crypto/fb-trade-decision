@@ -108,8 +108,17 @@ class TradeDecision:
                 except Exception:
                     pass
 
-                if position_size * current_price < MIN_SIZE_USDT:
-                    logger.info(f"  {symbol}: size={position_size} ({position_size*current_price:.1f} USDT) < min → ignora")
+                # Verifica o limite de valor minimo real exigido pela Binance
+                min_cost = 5.0
+                try:
+                    cost_limit = self.exchange.market(symbol).get("limits", {}).get("cost", {}).get("min")
+                    if cost_limit is not None:
+                        min_cost = float(cost_limit)
+                except Exception:
+                    pass
+
+                if position_size * current_price < min_cost:
+                    logger.info(f"  {symbol}: size={position_size} ({position_size*current_price:.1f} USDT) < Binance Min ({min_cost}) → ignora")
                     continue
 
                 sl_price = round(current_price - SL_ATR * atr, 4)
