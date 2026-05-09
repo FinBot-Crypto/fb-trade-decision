@@ -60,6 +60,24 @@ class TradeDecision:
             logger.error(f"Erro ao buscar balance USDT: {e}")
             return 0.0
 
+    async def get_total_portfolio(self):
+        """Retorna patrimônio total em USDT (saldo + valor de todas moedas)."""
+        try:
+            balance = self.exchange.fetch_balance()
+            total = float(balance["USDT"]["free"])
+            for asset, amount in balance["total"].items():
+                if asset == "USDT" or amount <= 0:
+                    continue
+                try:
+                    ticker = self.exchange.fetch_ticker(f"{asset}/USDT")
+                    total += amount * ticker["last"]
+                except Exception:
+                    pass
+            return total
+        except Exception as e:
+            logger.error(f"Erro ao calcular patrimônio: {e}")
+            return 0.0
+
     async def process_opportunity(self, msg):
         try:
             opportunities = json.loads(msg.data.decode())
@@ -72,7 +90,8 @@ class TradeDecision:
                 await msg.ack()
                 return
 
-            logger.info(f"Balance USDT: {usdt_balance:.2f}")
+            portfolio = await self.get_total_portfolio()
+            logger.info(f"Patrimônio: ${portfolio:.2f} | USDT: ${usdt_balance:.2f}")
 
             for opp in opportunities:
                 symbol = opp["symbol"]
@@ -92,39 +111,46 @@ class TradeDecision:
 
                 atr = self.compute_atr(highs, lows, closes)
 
-                # Exposição total = saldo × RISK_PERCENT, distribuída igualmente
-                exposed_capital = usdt_balance * RISK_PERCENT
-                notional_per_trade = max(MIN_SIZE_USDT, exposed_capital / MAX_POSITIONS) if MAX_POSITIONS > 0 else exposed_capital
-                position_size = notional_per_trade / current_price if current_price > 0 else 0
-                risk_usdt = position_size * atr * SL_ATR  # risco real baseado no ATR
-
-                # Verifica o limite de valor minimo real exigido pela Binance
-                min_cost = 5.0
+                # 1. Mínimo da Binance
+                min_notional = 5.0
                 try:
-                    cost_limit = self.exchange.market(symbol).get("limits", {}).get("cost", {}).get("min")
-                    if cost_limit is not None:
-                        min_cost = float(cost_limit)
+                    min_notional = float(self.exchange.market(symbol)["limits"]["cost"]["min"])
                 except Exception:
                     pass
 
-                # A sacada do usuario: Se o valor calculado for menor que o exigido pela exchange,
-                # nós ajustamos o valor de compra para cima (com uma margem de segurança para taxas)
-                # para garantir que a ordem passe!
-                target_notional = max(position_size * current_price, min_cost * 1.05)
-                position_size = target_notional / current_price if current_price > 0 else 0
+                # 2. Candidato baseado no patrimônio total
+                exposed = portfolio * RISK_PERCENT
+                candidate_notional = exposed / MAX_POSITIONS if MAX_POSITIONS > 0 else exposed
 
-                # Arredonda novamente após o ajuste
+                # 3. SL dita o minimo (perna mais frágil do OCO)
+                sl_price = current_price - SL_ATR * atr
+                tp_price = current_price + TP_ATR * atr
+
+                # Quantos $ precisa pra perna SL bater o mínimo?
+                sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
+                sl_min_notional = sl_min_qty * current_price  # notional de entrada equivalente
+
+                # 4. Entrada = max(candidato, piso da Binance, piso do SL)
+                notional_per_trade = max(candidate_notional, min_notional, sl_min_notional)
+
+                # 5. Cap pelo USDT disponível (não podemos comprar mais do que temos)
+                notional_per_trade = min(notional_per_trade, usdt_balance * 0.98)  # 2% pra taxas
+
+                # 6. Quantidade
+                position_size = notional_per_trade / current_price if current_price > 0 else 0
+                risk_usdt = position_size * atr * SL_ATR
+
+                # 7. Formata e valida
                 try:
                     position_size = float(self.exchange.amount_to_precision(symbol, position_size))
                 except Exception:
                     pass
 
-                if position_size * current_price < min_cost:
-                    logger.info(f"  {symbol}: size={position_size} ({position_size*current_price:.1f} USDT) < Binance Min ({min_cost}) → ignora")
-                    continue
+                final_notional = position_size * current_price
 
-                sl_price = round(current_price - SL_ATR * atr, 4)
-                tp_price = round(current_price + TP_ATR * atr, 4)
+                if final_notional < min_notional:
+                    logger.info(f"  {symbol}: size={position_size} (${final_notional:.1f}) < Min Binance (${min_notional}) → ignora")
+                    continue
 
                 order = {
                     "symbol": symbol,
