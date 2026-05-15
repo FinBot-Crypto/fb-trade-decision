@@ -19,6 +19,13 @@ NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.05"))  # 100% = todo saldo distribuído
 SL_ATR = float(os.getenv("SL_ATR", "2.0"))
 TP_ATR = float(os.getenv("TP_ATR", "4.0"))
+
+# Piso e Teto para SL e TP em percentual
+MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.01"))  # Padrão 1%
+MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.03"))  # Padrão 3%
+MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "0.02"))  # Padrão 2%
+MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.06"))  # Padrão 6%
+
 ATR_PERIOD = 14
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "20"))
 MIN_SIZE_USDT = float(os.getenv("MIN_SIZE_USDT", "5.0"))  # tamanho minimo da posicao
@@ -123,21 +130,17 @@ class TradeDecision:
                 candidate_notional = exposed / MAX_POSITIONS if MAX_POSITIONS > 0 else exposed
 
                 # 3. SL dita o minimo (perna mais frágil do OCO)
-                # Prazos mínimos em porcentagem (Piso)
-                min_sl_pct = 0.01  # 1%
-                min_tp_pct = 0.02  # 2%
-                
                 # Distâncias baseadas em ATR
                 atr_sl_dist = SL_ATR * atr
                 atr_tp_dist = TP_ATR * atr
                 
-                # Distâncias mínimas (Piso)
-                floor_sl_dist = current_price * min_sl_pct
-                floor_tp_dist = current_price * min_tp_pct
+                # Aplicar piso e teto no SL
+                sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
+                sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
                 
-                # Usar o maior entre o piso e o ATR
-                sl_dist = max(atr_sl_dist, floor_sl_dist)
-                tp_dist = max(atr_tp_dist, floor_tp_dist)
+                # Aplicar piso e teto no TP
+                tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
+                tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
                 
                 sl_price = current_price - sl_dist
                 tp_price = current_price + tp_dist
