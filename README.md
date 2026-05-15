@@ -8,10 +8,9 @@ Calcula position sizing, Stop Loss e Take Profit para cada oportunidade de trade
 trade.opportunity (fb-decision-engine)
   → fb-trade-decision
     → fetch balance USDT
-    → fetch ATR (14 períodos, 15m)
     → position_size = (RISK_PERCENT × capital) / (SL_ATR × ATR)
-    → SL = entry - SL_ATR × ATR
-    → TP = entry + TP_ATR × ATR
+    → SL = entry - max(SL_ATR × ATR, 1% do preço)
+    → TP = entry + max(TP_ATR × ATR, 2% do preço)
     → trade.order
 ```
 
