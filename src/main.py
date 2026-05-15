@@ -123,8 +123,24 @@ class TradeDecision:
                 candidate_notional = exposed / MAX_POSITIONS if MAX_POSITIONS > 0 else exposed
 
                 # 3. SL dita o minimo (perna mais frágil do OCO)
-                sl_price = current_price - SL_ATR * atr
-                tp_price = current_price + TP_ATR * atr
+                # Prazos mínimos em porcentagem (Piso)
+                min_sl_pct = 0.01  # 1%
+                min_tp_pct = 0.02  # 2%
+                
+                # Distâncias baseadas em ATR
+                atr_sl_dist = SL_ATR * atr
+                atr_tp_dist = TP_ATR * atr
+                
+                # Distâncias mínimas (Piso)
+                floor_sl_dist = current_price * min_sl_pct
+                floor_tp_dist = current_price * min_tp_pct
+                
+                # Usar o maior entre o piso e o ATR
+                sl_dist = max(atr_sl_dist, floor_sl_dist)
+                tp_dist = max(atr_tp_dist, floor_tp_dist)
+                
+                sl_price = current_price - sl_dist
+                tp_price = current_price + tp_dist
 
                 # Quantos $ precisa pra perna SL bater o mínimo?
                 sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
