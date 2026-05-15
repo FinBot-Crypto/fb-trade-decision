@@ -23,6 +23,10 @@ trade.opportunity (fb-decision-engine)
 | `SL_ATR` | `2.0` | Multiplicador do ATR para Stop Loss |
 | `TP_ATR` | `4.0` | Multiplicador do ATR para Take Profit |
 | `MIN_SIZE_USDT` | `15.0` | Tamanho mínimo da posição em USDT |
+| `MIN_SL_PCT` | `0.01` | Piso mínimo para Stop Loss (1%) |
+| `MAX_SL_PCT` | `0.03` | Teto máximo para Stop Loss (3%) |
+| `MIN_TP_PCT` | `0.02` | Piso mínimo para Take Profit (2%) |
+| `MAX_TP_PCT` | `0.06` | Teto máximo para Take Profit (6%) |
 | `BINANCE_API_KEY` | | Chave API Binance |
 | `BINANCE_API_SECRET` | | Secret API Binance |
 
