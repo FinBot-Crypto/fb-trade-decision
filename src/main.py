@@ -131,23 +131,24 @@ class TradeDecision:
 
                 # 3. SL dita o minimo (perna mais frágil do OCO)
                 # Distâncias baseadas em ATR
-                atr_sl_dist = SL_ATR * atr
+                if SL_ATR <= 0:
+                    sl_price = 0.0
+                    sl_min_notional = 0.0
+                else:
+                    atr_sl_dist = SL_ATR * atr
+                    # Aplicar piso e teto no SL
+                    sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
+                    sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
+                    sl_price = current_price - sl_dist
+                    # Quantos $ precisa pra perna SL bater o mínimo?
+                    sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
+                    sl_min_notional = sl_min_qty * current_price  # notional de entrada equivalente
+
                 atr_tp_dist = TP_ATR * atr
-                
-                # Aplicar piso e teto no SL
-                sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
-                sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
-                
                 # Aplicar piso e teto no TP
                 tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
                 tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
-                
-                sl_price = current_price - sl_dist
                 tp_price = current_price + tp_dist
-
-                # Quantos $ precisa pra perna SL bater o mínimo?
-                sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
-                sl_min_notional = sl_min_qty * current_price  # notional de entrada equivalente
 
                 # 4. Entrada = max(candidato, piso da Binance, piso do SL)
                 notional_per_trade = max(candidate_notional, min_notional, sl_min_notional)
