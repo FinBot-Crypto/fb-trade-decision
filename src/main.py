@@ -72,6 +72,11 @@ class TradeDecision:
     async def connect_nats(self):
         self.nc = await nats.connect(NATS_URL)
         self.js = self.nc.jetstream()
+        try:
+            self.kv = await self.js.key_value("active_positions")
+        except Exception as e:
+            logger.error(f"Erro ao obter KV active_positions no trade-decision: {e}")
+            self.kv = None
         logger.info(f"NATS conectado: {NATS_URL}")
 
     def compute_atr(self, highs, lows, closes):
@@ -117,6 +122,23 @@ class TradeDecision:
             logger.error(f"Erro ao calcular patrimônio Spot: {e}")
             return 0.0
 
+    async def count_active_futures_positions(self):
+        """Conta posições ativas de Futures no KV store."""
+        if not self.kv:
+            return 0
+        try:
+            keys = await self.kv.keys()
+            count = 0
+            for key in keys:
+                entry = await self.kv.get(key)
+                if entry:
+                    val = json.loads(entry.value.decode())
+                    if val.get("is_futures"):
+                        count += 1
+            return count
+        except Exception:
+            return 0
+
     async def process_opportunity(self, msg):
         try:
             opportunities = json.loads(msg.data.decode())
@@ -130,7 +152,10 @@ class TradeDecision:
             futures_balance = await self.get_futures_usdt_balance()
             spot_portfolio = await self.get_total_spot_portfolio()
 
-            logger.info(f"Saldos Reais | Spot USDT: ${spot_balance:.2f} (Total: ${spot_portfolio:.2f}) | Futures USDT: ${futures_balance:.2f}")
+            # Conta quantidade de posições ativas de Futures
+            active_futures = await self.count_active_futures_positions()
+
+            logger.info(f"Saldos Reais | Spot USDT: ${spot_balance:.2f} (Total: ${spot_portfolio:.2f}) | Futures USDT: ${futures_balance:.2f} | Posições Futures Ativas: {active_futures}/{FUTURES_MAX_POSITIONS}")
 
             for opp in opportunities:
                 symbol = opp["symbol"]
@@ -141,35 +166,44 @@ class TradeDecision:
                 is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
                 current_exchange = self.futures_exchange if is_futures_route else self.spot_exchange
 
-                # Se a rota inicial for Futures, fazemos a verificação preventiva de saldo/margem livre
+                # Se a rota inicial for Futures, fazemos a verificação preventiva de limite de posições e de saldo/margem livre
                 if is_futures_route:
-                    if score >= 0.95:
-                        leverage = LEVERAGE_MAX
-                    elif score >= 0.90:
-                        leverage = LEVERAGE_HIGH
-                    else:
-                        leverage = 2
-
-                    min_notional_f = 5.0
-                    try:
-                        min_notional_f = float(self.futures_exchange.market(symbol)["limits"]["cost"]["min"])
-                    except Exception:
-                        pass
-
-                    # 100% do saldo de Futures dividido por posições máximas
-                    candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
-                    
-                    # Garante que atende ao mínimo exigido pela moeda
-                    notional_per_trade = max(candidate_notional, min_notional_f)
-                    
-                    # Margem necessária para a posição
-                    margin_required = notional_per_trade / leverage
-                    
-                    # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
-                    if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
-                        logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
+                    # Verifica limite de posições preventivamente
+                    if active_futures >= FUTURES_MAX_POSITIONS:
+                        logger.warning(f"  [FALLBACK] Limite de posições Futures atingido ({active_futures}/{FUTURES_MAX_POSITIONS}). Desviando {symbol} para SPOT.")
                         is_futures_route = False
                         current_exchange = self.spot_exchange
+                    else:
+                        if score >= 0.95:
+                            leverage = LEVERAGE_MAX
+                        elif score >= 0.90:
+                            leverage = LEVERAGE_HIGH
+                        else:
+                            leverage = 2
+
+                        min_notional_f = 5.0
+                        try:
+                            min_notional_f = float(self.futures_exchange.market(symbol)["limits"]["cost"]["min"])
+                        except Exception:
+                            pass
+
+                        # 100% do saldo de Futures dividido por posições máximas
+                        candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
+                        
+                        # Garante que atende ao mínimo exigido pela moeda
+                        notional_per_trade = max(candidate_notional, min_notional_f)
+                        
+                        # Margem necessária para a posição
+                        margin_required = notional_per_trade / leverage
+                        
+                        # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
+                        if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
+                            logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
+                            is_futures_route = False
+                            current_exchange = self.spot_exchange
+                        else:
+                            # Se passou nas validações, incrementamos preventivamente para a próxima oportunidade do mesmo loop
+                            active_futures += 1
 
                 try:
                     ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=50)
