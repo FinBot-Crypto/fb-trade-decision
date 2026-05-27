@@ -1,13 +1,13 @@
 """
-fb-trade-decision: Calcula position sizing, SL e TP.
+fb-trade-decision: Calcula position sizing, SL e TP para Spot e Futures.
 
 Fluxo:
   trade.opportunity → para cada oportunidade:
+    → decide rota (Spot ou Futures) com base no score e FUTURES_ENABLED
+    → calcula leverage para Futures (2x, 3x, 5x)
     → fetch preço atual + ATR
-    → position_size = (RISK_PERCENT * capital) / (SL_ATR * atr)
-    → SL = price - SL_ATR * atr
-    → TP = price + TP_ATR * atr
-    → publica trade.order
+    → calcula tamanho com base no saldo real e limites mínimos da Binance
+    → publica no canal correspondente (trade.order ou trade.order.futures)
 """
 import asyncio, logging, os, json, numpy as np, ccxt, nats
 from nats.js.api import ConsumerConfig
@@ -16,19 +16,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("fb-trade-decision")
 
 NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.05"))  # 100% = todo saldo distribuído
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.05"))
 SL_ATR = float(os.getenv("SL_ATR", "2.0"))
 TP_ATR = float(os.getenv("TP_ATR", "4.0"))
 
 # Piso e Teto para SL e TP em percentual
-MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.01"))  # Padrão 1%
-MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.03"))  # Padrão 3%
-MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "0.02"))  # Padrão 2%
-MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.06"))  # Padrão 6%
+MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.01"))
+MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.03"))
+MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "0.02"))
+MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.06"))
 
 ATR_PERIOD = 14
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "20"))
-MIN_SIZE_USDT = float(os.getenv("MIN_SIZE_USDT", "5.0"))  # tamanho minimo da posicao
+MIN_SIZE_USDT = float(os.getenv("MIN_SIZE_USDT", "5.0"))
+
+# Configurações de Futures
+FUTURES_ENABLED = os.getenv("FUTURES_ENABLED", "false").lower() == "true"
+FUTURES_MIN_SCORE = float(os.getenv("FUTURES_MIN_SCORE", "0.85"))
+FUTURES_MAX_POSITIONS = int(os.getenv("FUTURES_MAX_POSITIONS", "5"))
+SPOT_MAX_POSITIONS = int(os.getenv("SPOT_MAX_POSITIONS", str(MAX_POSITIONS)))
+LEVERAGE_HIGH = int(os.getenv("LEVERAGE_HIGH", "3"))
+LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "5"))
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -38,11 +46,28 @@ class TradeDecision:
     def __init__(self):
         self.nc = None
         self.js = None
-        self.exchange = ccxt.binance({
+        self.spot_exchange = ccxt.binance({
             "apiKey": BINANCE_API_KEY,
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
         })
+        self.futures_exchange = ccxt.binance({
+            "apiKey": BINANCE_API_KEY,
+            "secret": BINANCE_API_SECRET,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "future"
+            }
+        })
+        # Compatibilidade
+        self.exchange = self.spot_exchange
+
+        try:
+            self.spot_exchange.load_markets()
+            self.futures_exchange.load_markets()
+            logger.info("Mercados carregados com sucesso (Spot + Futures).")
+        except Exception as e:
+            logger.error(f"Erro ao inicializar mercados: {e}")
 
     async def connect_nats(self):
         self.nc = await nats.connect(NATS_URL)
@@ -59,56 +84,67 @@ class TradeDecision:
         atr = pd.Series(tr).rolling(ATR_PERIOD).mean().values
         return float(atr[-1])
 
-    async def get_usdt_balance(self):
+    async def get_spot_usdt_balance(self):
         try:
-            balance = self.exchange.fetch_balance()
+            balance = self.spot_exchange.fetch_balance()
             return float(balance["USDT"]["free"])
         except Exception as e:
-            logger.error(f"Erro ao buscar balance USDT: {e}")
+            logger.error(f"Erro ao buscar balance USDT Spot: {e}")
             return 0.0
 
-    async def get_total_portfolio(self):
-        """Retorna patrimônio total em USDT (saldo + valor de todas moedas)."""
+    async def get_futures_usdt_balance(self):
         try:
-            balance = self.exchange.fetch_balance()
+            balance = self.futures_exchange.fetch_balance()
+            return float(balance["USDT"]["free"])
+        except Exception as e:
+            logger.error(f"Erro ao buscar balance USDT Futures: {e}")
+            return 0.0
+
+    async def get_total_spot_portfolio(self):
+        try:
+            balance = self.spot_exchange.fetch_balance()
             total = float(balance["USDT"]["free"])
             for asset, amount in balance["total"].items():
                 if asset == "USDT" or amount <= 0:
                     continue
                 try:
-                    ticker = self.exchange.fetch_ticker(f"{asset}/USDT")
+                    ticker = self.spot_exchange.fetch_ticker(f"{asset}/USDT")
                     total += amount * ticker["last"]
                 except Exception:
                     pass
             return total
         except Exception as e:
-            logger.error(f"Erro ao calcular patrimônio: {e}")
+            logger.error(f"Erro ao calcular patrimônio Spot: {e}")
             return 0.0
 
     async def process_opportunity(self, msg):
         try:
             opportunities = json.loads(msg.data.decode())
             logger.info(f"Calculando sizing para {len(opportunities)} oportunidades")
-            orders = []
+            
+            spot_orders = []
+            futures_orders = []
 
-            usdt_balance = await self.get_usdt_balance()
-            if usdt_balance <= 0:
-                logger.error("Balance USDT zerado ou indisponível")
-                await msg.ack()
-                return
+            # 1. Busca saldos reais diretamente via API (segundo especificação do usuário)
+            spot_balance = await self.get_spot_usdt_balance()
+            futures_balance = await self.get_futures_usdt_balance()
+            spot_portfolio = await self.get_total_spot_portfolio()
 
-            portfolio = await self.get_total_portfolio()
-            logger.info(f"Patrimônio: ${portfolio:.2f} | USDT: ${usdt_balance:.2f}")
+            logger.info(f"Saldos Reais | Spot USDT: ${spot_balance:.2f} (Total: ${spot_portfolio:.2f}) | Futures USDT: ${futures_balance:.2f}")
 
             for opp in opportunities:
                 symbol = opp["symbol"]
                 score = opp["score"]
                 rsi = opp.get("rsi", 0)
 
+                # 2. Decide a Rota (Futures vs Spot)
+                is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
+                current_exchange = self.futures_exchange if is_futures_route else self.spot_exchange
+
                 try:
-                    ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=50)
+                    ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=50)
                 except Exception as e:
-                    logger.error(f"Erro OHLCV {symbol}: {e}")
+                    logger.error(f"Erro ao buscar OHLCV {symbol} ({'Futures' if is_futures_route else 'Spot'}): {e}")
                     continue
 
                 highs = [c[2] for c in ohlcv]
@@ -118,58 +154,69 @@ class TradeDecision:
 
                 atr = self.compute_atr(highs, lows, closes)
 
-                # 1. Mínimo da Binance
+                # 3. Limite Mínimo da Binance
                 min_notional = 5.0
                 try:
-                    min_notional = float(self.exchange.market(symbol)["limits"]["cost"]["min"])
+                    min_notional = float(current_exchange.market(symbol)["limits"]["cost"]["min"])
                 except Exception:
                     pass
 
-                # 2. Candidato baseado no patrimônio total
-                exposed = portfolio * RISK_PERCENT
-                candidate_notional = exposed / MAX_POSITIONS if MAX_POSITIONS > 0 else exposed
+                # 4. Cálculo do Position Sizing
+                if is_futures_route:
+                    # Determina Alavancagem dinâmica com base no Score
+                    if score >= 0.95:
+                        leverage = LEVERAGE_MAX
+                    elif score >= 0.90:
+                        leverage = LEVERAGE_HIGH
+                    else:
+                        leverage = 2
 
-                # 3. SL dita o minimo (perna mais frágil do OCO)
-                # Distâncias baseadas em ATR
-                if SL_ATR <= 0:
-                    sl_price = 0.0
+                    # Notional com Alavancagem
+                    candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
+                    # Não usar mais margem do que o saldo total
+                    max_notional_cap = futures_balance * leverage * 0.98
+                    notional_per_trade = min(candidate_notional, max_notional_cap)
+                    
+                    sl_price = 0.0 # Sem Stop Loss na barra para Futures, controlado por Time Exit / Sentinela
                     sl_min_notional = 0.0
                 else:
-                    atr_sl_dist = SL_ATR * atr
-                    # Aplicar piso e teto no SL
-                    sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
-                    sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
-                    sl_price = current_price - sl_dist
-                    # Quantos $ precisa pra perna SL bater o mínimo?
-                    sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
-                    sl_min_notional = sl_min_qty * current_price  # notional de entrada equivalente
+                    leverage = 1
+                    exposed = spot_portfolio * RISK_PERCENT
+                    candidate_notional = exposed / SPOT_MAX_POSITIONS if SPOT_MAX_POSITIONS > 0 else exposed
 
+                    # SL dita o minimo para Spot (perna mais frágil do OCO)
+                    if SL_ATR <= 0:
+                        sl_price = 0.0
+                        sl_min_notional = 0.0
+                    else:
+                        atr_sl_dist = SL_ATR * atr
+                        sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
+                        sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
+                        sl_price = current_price - sl_dist
+                        sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
+                        sl_min_notional = sl_min_qty * current_price
+
+                    notional_per_trade = max(candidate_notional, min_notional, sl_min_notional)
+                    notional_per_trade = min(notional_per_trade, spot_balance * 0.98)
+
+                # Calcular preço de alvo (Take Profit)
                 atr_tp_dist = TP_ATR * atr
-                # Aplicar piso e teto no TP
                 tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
                 tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
                 tp_price = current_price + tp_dist
 
-                # 4. Entrada = max(candidato, piso da Binance, piso do SL)
-                notional_per_trade = max(candidate_notional, min_notional, sl_min_notional)
-
-                # 5. Cap pelo USDT disponível (não podemos comprar mais do que temos)
-                notional_per_trade = min(notional_per_trade, usdt_balance * 0.98)  # 2% pra taxas
-
-                # 6. Quantidade
+                # 5. Quantidade final formatada
                 position_size = notional_per_trade / current_price if current_price > 0 else 0
-                risk_usdt = position_size * atr * SL_ATR
-
-                # 7. Formata e valida
                 try:
-                    position_size = float(self.exchange.amount_to_precision(symbol, position_size))
+                    position_size = float(current_exchange.amount_to_precision(symbol, position_size))
                 except Exception:
                     pass
 
                 final_notional = position_size * current_price
 
+                # Validação de Mínimo da Binance
                 if final_notional < min_notional:
-                    logger.info(f"  {symbol}: size={position_size} (${final_notional:.1f}) < Min Binance (${min_notional}) → ignora")
+                    logger.info(f"  {symbol}: size={position_size} (${final_notional:.1f}) < Min Binance (${min_notional}) → ignorando")
                     continue
 
                 order = {
@@ -184,18 +231,31 @@ class TradeDecision:
                     "sl_price": sl_price,
                     "tp_price": tp_price,
                     "atr": round(atr, 6),
-                    "risk_usdt": round(risk_usdt, 2),
-                    "notional": round(position_size * current_price, 2),
+                    "notional": round(final_notional, 2),
                     "timestamp": opp.get("timestamp", ""),
                 }
 
-                logger.info(f"  {symbol}: qty={position_size} entry={current_price} SL={sl_price} TP={tp_price} risk={risk_usdt:.1f}USDT")
-                orders.append(order)
+                if is_futures_route:
+                    order["leverage"] = leverage
+                    order["is_futures"] = True
+                    futures_orders.append(order)
+                    logger.info(f"  [FUTURES ROUTE] {symbol}: qty={position_size} entry={current_price} TP={tp_price} leverage={leverage}x notional={final_notional:.2f}")
+                else:
+                    order["leverage"] = 1
+                    order["is_futures"] = False
+                    spot_orders.append(order)
+                    logger.info(f"  [SPOT ROUTE] {symbol}: qty={position_size} entry={current_price} SL={sl_price} TP={tp_price} notional={final_notional:.2f}")
 
-            if orders:
-                payload = json.dumps(orders).encode()
+            # 6. Publicação das Ordens
+            if spot_orders:
+                payload = json.dumps(spot_orders).encode()
                 await self.js.publish("trade.order", payload)
-                logger.info(f"Publicadas {len(orders)} ordens em trade.order")
+                logger.info(f"Publicadas {len(spot_orders)} ordens em trade.order (Spot)")
+
+            if futures_orders:
+                payload = json.dumps(futures_orders).encode()
+                await self.js.publish("trade.order.futures", payload)
+                logger.info(f"Publicadas {len(futures_orders)} ordens em trade.order.futures (Futures)")
 
             await msg.ack()
         except Exception as e:
@@ -206,7 +266,7 @@ class TradeDecision:
         await self.js.subscribe("trade.opportunity", durable="TRADE_DECISION_WORKER",
                                  cb=self.process_opportunity, manual_ack=True,
                                  config=ConsumerConfig(ack_wait=30))
-        logger.info(f"fb-trade-decision online (risk={RISK_PERCENT*100}%, SL={SL_ATR}xATR, TP={TP_ATR}xATR)")
+        logger.info(f"fb-trade-decision online (Spot + Futures) [Futures={FUTURES_ENABLED}, min_score={FUTURES_MIN_SCORE}]")
         while True:
             if self.nc.is_closed:
                 await self.connect_nats()
