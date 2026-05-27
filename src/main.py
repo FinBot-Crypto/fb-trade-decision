@@ -137,9 +137,39 @@ class TradeDecision:
                 score = opp["score"]
                 rsi = opp.get("rsi", 0)
 
-                # 2. Decide a Rota (Futures vs Spot)
+                # 2. Decide a Rota Inicial (Futures vs Spot)
                 is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
                 current_exchange = self.futures_exchange if is_futures_route else self.spot_exchange
+
+                # Se a rota inicial for Futures, fazemos a verificação preventiva de saldo/margem livre
+                if is_futures_route:
+                    if score >= 0.95:
+                        leverage = LEVERAGE_MAX
+                    elif score >= 0.90:
+                        leverage = LEVERAGE_HIGH
+                    else:
+                        leverage = 2
+
+                    min_notional_f = 5.0
+                    try:
+                        min_notional_f = float(self.futures_exchange.market(symbol)["limits"]["cost"]["min"])
+                    except Exception:
+                        pass
+
+                    # 100% do saldo de Futures dividido por posições máximas
+                    candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
+                    
+                    # Garante que atende ao mínimo exigido pela moeda
+                    notional_per_trade = max(candidate_notional, min_notional_f)
+                    
+                    # Margem necessária para a posição
+                    margin_required = notional_per_trade / leverage
+                    
+                    # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
+                    if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
+                        logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
+                        is_futures_route = False
+                        current_exchange = self.spot_exchange
 
                 try:
                     ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=50)
@@ -161,24 +191,10 @@ class TradeDecision:
                 except Exception:
                     pass
 
-                # 4. Cálculo do Position Sizing
+                # 4. Cálculo do Position Sizing final
                 if is_futures_route:
-                    # Determina Alavancagem dinâmica com base no Score
-                    if score >= 0.95:
-                        leverage = LEVERAGE_MAX
-                    elif score >= 0.90:
-                        leverage = LEVERAGE_HIGH
-                    else:
-                        leverage = 2
-
-                    # Notional com Alavancagem
-                    candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
-                    # Não usar mais margem do que o saldo total
-                    max_notional_cap = futures_balance * leverage * 0.98
-                    notional_per_trade = min(candidate_notional, max_notional_cap)
-                    
-                    sl_price = 0.0 # Sem Stop Loss na barra para Futures, controlado por Time Exit / Sentinela
-                    sl_min_notional = 0.0
+                    # (Lógica e valores de Futures já validados e calculados acima)
+                    sl_price = 0.0
                 else:
                     leverage = 1
                     exposed = spot_portfolio * RISK_PERCENT
