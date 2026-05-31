@@ -37,6 +37,7 @@ FUTURES_MAX_POSITIONS = int(os.getenv("FUTURES_MAX_POSITIONS", "5"))
 SPOT_MAX_POSITIONS = int(os.getenv("SPOT_MAX_POSITIONS", str(MAX_POSITIONS)))
 LEVERAGE_HIGH = int(os.getenv("LEVERAGE_HIGH", "3"))
 LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "5"))
+COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "0"))  # 0 = desligado
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -68,6 +69,17 @@ class TradeDecision:
             logger.info("Mercados carregados com sucesso (Spot + Futures).")
         except Exception as e:
             logger.error(f"Erro ao inicializar mercados: {e}")
+
+        # Cooldown: evita reentrar na mesma moeda por X horas
+        self.last_exit_time = {}  # symbol -> timestamp da última saída
+        import time, psycopg2
+        self._time = time
+        try:
+            self._db_conn = psycopg2.connect(os.getenv("DATABASE_URL", ""))
+            self._db_cursor = self._db_conn.cursor()
+        except Exception:
+            self._db_conn = None
+            self._db_cursor = None
 
     async def connect_nats(self):
         self.nc = await nats.connect(NATS_URL)
@@ -161,6 +173,23 @@ class TradeDecision:
                 symbol = opp["symbol"]
                 score = opp["score"]
                 rsi = opp.get("rsi", 0)
+
+                # Cooldown: só bloqueia se último trade foi LOSS
+                if COOLDOWN_HOURS > 0 and symbol in self.last_exit_time:
+                    elapsed = self._time.time() - self.last_exit_time[symbol]
+                    if elapsed < COOLDOWN_HOURS * 3600:
+                        # Verifica se o último trade fechado desse símbolo foi loss
+                        try:
+                            cur = self._db_cursor
+                            cur.execute(
+                                "SELECT pnl_pct FROM trade_log WHERE symbol=%s AND status='CLOSED' ORDER BY created_at DESC LIMIT 1",
+                                (symbol,))
+                            row = cur.fetchone()
+                            if row and (row[0] is None or row[0] <= 0):
+                                logger.info(f"  {symbol}: cooldown após loss ({elapsed/3600:.1f}h < {COOLDOWN_HOURS}h) → ignora")
+                                continue
+                        except Exception:
+                            pass
 
                 # 2. Decide a Rota Inicial (Futures vs Spot)
                 is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
@@ -301,11 +330,15 @@ class TradeDecision:
                 payload = json.dumps(spot_orders).encode()
                 await self.js.publish("trade.order", payload)
                 logger.info(f"Publicadas {len(spot_orders)} ordens em trade.order (Spot)")
+                for o in spot_orders:
+                    self.last_exit_time[o["symbol"]] = self._time.time()
 
             if futures_orders:
                 payload = json.dumps(futures_orders).encode()
                 await self.js.publish("trade.order.futures", payload)
                 logger.info(f"Publicadas {len(futures_orders)} ordens em trade.order.futures (Futures)")
+                for o in futures_orders:
+                    self.last_exit_time[o["symbol"]] = self._time.time()
 
             await msg.ack()
         except Exception as e:
