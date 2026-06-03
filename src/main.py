@@ -173,26 +173,33 @@ class TradeDecision:
                 symbol = opp["symbol"]
                 score = opp["score"]
                 rsi = opp.get("rsi", 0)
+                direction = opp.get("direction", "LONG")
+                is_short = direction == "SHORT"
 
-                # Cooldown: só bloqueia se último trade foi LOSS
-                if COOLDOWN_HOURS > 0 and symbol in self.last_exit_time:
-                    elapsed = self._time.time() - self.last_exit_time[symbol]
-                    if elapsed < COOLDOWN_HOURS * 3600:
-                        # Verifica se o último trade fechado desse símbolo foi loss
-                        try:
-                            cur = self._db_cursor
-                            cur.execute(
-                                "SELECT pnl_pct FROM trade_log WHERE symbol=%s AND status='CLOSED' ORDER BY created_at DESC LIMIT 1",
-                                (symbol,))
-                            row = cur.fetchone()
-                            if row and (row[0] is None or row[0] <= 0):
-                                logger.info(f"  {symbol}: cooldown após loss ({elapsed/3600:.1f}h < {COOLDOWN_HOURS}h) → ignora")
+                # Cooldown: conta a partir da hora do FECHAMENTO do último trade (não da ordem)
+                if COOLDOWN_HOURS > 0:
+                    try:
+                        cur = self._db_cursor
+                        cur.execute(
+                            "SELECT pnl_pct, EXTRACT(EPOCH FROM updated_at) FROM trade_log WHERE symbol=%s AND status='CLOSED' ORDER BY updated_at DESC LIMIT 1",
+                            (symbol,))
+                        row = cur.fetchone()
+                        if row and row[0] is not None and row[1] is not None:
+                            last_pnl = float(row[0])
+                            last_exit_ts = float(row[1])
+                            elapsed = self._time.time() - last_exit_ts
+                            if elapsed < COOLDOWN_HOURS * 3600 and last_pnl <= 0:
+                                logger.info(f"  {symbol}: cooldown após loss ({elapsed/3600:.1f}h < {COOLDOWN_HOURS}h, saída às {elapsed/60:.0f}min atrás) → ignora")
                                 continue
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
 
                 # 2. Decide a Rota Inicial (Futures vs Spot)
-                is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
+                # SHORT sempre vai pra Futures; LONG segue lógica normal
+                if is_short:
+                    is_futures_route = True
+                else:
+                    is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
                 current_exchange = self.futures_exchange if is_futures_route else self.spot_exchange
 
                 # Se a rota inicial for Futures, fazemos a verificação preventiva de limite de posições e de saldo/margem livre
@@ -227,6 +234,9 @@ class TradeDecision:
                         
                         # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
                         if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
+                            if is_short:
+                                logger.warning(f"  {symbol}: SHORT sem saldo Futures (${futures_balance:.2f}) → ignorando (sem fallback pra Spot)")
+                                continue
                             logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
                             is_futures_route = False
                             current_exchange = self.spot_exchange
@@ -256,7 +266,10 @@ class TradeDecision:
 
                 # 4. Cálculo do Position Sizing final
                 if is_futures_route:
-                    # (Lógica e valores de Futures já validados e calculados acima)
+                    if is_short:
+                        leverage = 2
+                        if score >= 0.95: leverage = LEVERAGE_MAX
+                        elif score >= 0.90: leverage = LEVERAGE_HIGH
                     sl_price = 0.0
                 else:
                     leverage = 1
@@ -282,7 +295,11 @@ class TradeDecision:
                 atr_tp_dist = TP_ATR * atr
                 tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
                 tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
-                tp_price = current_price + tp_dist
+                if is_short:
+                    tp_price = current_price - tp_dist
+                    sl_price = current_price + tp_dist  # SL acima na SHORT
+                else:
+                    tp_price = current_price + tp_dist
 
                 # 5. Quantidade final formatada
                 position_size = notional_per_trade / current_price if current_price > 0 else 0
@@ -302,7 +319,7 @@ class TradeDecision:
                     "symbol": symbol,
                     "tier": opp.get("tier", ""),
                     "strategy": opp.get("strategy", ""),
-                    "direction": "LONG",
+                    "direction": direction,
                     "score": score,
                     "rsi": rsi,
                     "entry_price": current_price,
