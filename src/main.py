@@ -17,8 +17,10 @@ logger = logging.getLogger("fb-trade-decision")
 
 NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.05"))
-SL_ATR = float(os.getenv("SL_ATR", "2.0"))
-TP_ATR = float(os.getenv("TP_ATR", "4.0"))
+SL_ATR_LONG = float(os.getenv("SL_ATR_LONG", os.getenv("SL_ATR", "2.0")))
+TP_ATR_LONG = float(os.getenv("TP_ATR_LONG", os.getenv("TP_ATR", "4.0")))
+SL_ATR_SHORT = float(os.getenv("SL_ATR_SHORT", "4.0"))
+TP_ATR_SHORT = float(os.getenv("TP_ATR_SHORT", "4.0"))
 
 # Piso e Teto para SL e TP em percentual
 MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.01"))
@@ -265,6 +267,9 @@ class TradeDecision:
                     pass
 
                 # 4. Cálculo do Position Sizing final
+                current_sl_atr = SL_ATR_SHORT if is_short else SL_ATR_LONG
+                current_tp_atr = TP_ATR_SHORT if is_short else TP_ATR_LONG
+
                 if is_futures_route:
                     if is_short:
                         leverage = 2
@@ -277,11 +282,11 @@ class TradeDecision:
                     candidate_notional = exposed / SPOT_MAX_POSITIONS if SPOT_MAX_POSITIONS > 0 else exposed
 
                     # SL dita o minimo para Spot (perna mais frágil do OCO)
-                    if SL_ATR <= 0:
+                    if current_sl_atr <= 0:
                         sl_price = 0.0
                         sl_min_notional = 0.0
                     else:
-                        atr_sl_dist = SL_ATR * atr
+                        atr_sl_dist = current_sl_atr * atr
                         sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
                         sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
                         sl_price = current_price - sl_dist
@@ -291,15 +296,22 @@ class TradeDecision:
                     notional_per_trade = max(candidate_notional, min_notional, sl_min_notional)
                     notional_per_trade = min(notional_per_trade, spot_balance * 0.98)
 
-                # Calcular preço de alvo (Take Profit)
-                atr_tp_dist = TP_ATR * atr
+                # Calcular preço de alvo (Take Profit) e Stop Loss
+                atr_tp_dist = current_tp_atr * atr
                 tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
                 tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
+
+                atr_sl_dist = current_sl_atr * atr
+                sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
+                sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
+
                 if is_short:
                     tp_price = current_price - tp_dist
-                    sl_price = current_price + tp_dist  # SL acima na SHORT
+                    sl_price = current_price + sl_dist  # SL acima na SHORT
                 else:
                     tp_price = current_price + tp_dist
+                    # Se for Spot, sl_price já foi calculado acima.
+                    # Se for Futures LONG, sl_price permanece 0.0.
 
                 # 5. Quantidade final formatada
                 position_size = notional_per_trade / current_price if current_price > 0 else 0
