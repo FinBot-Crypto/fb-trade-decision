@@ -178,73 +178,134 @@ class TradeDecision:
                 direction = opp.get("direction", "LONG")
                 is_short = direction == "SHORT"
 
-                # Cooldown: conta a partir da hora do FECHAMENTO do último trade (não da ordem)
-                if COOLDOWN_HOURS > 0:
-                    try:
-                        cur = self._db_cursor
-                        cur.execute(
-                            "SELECT pnl_pct, EXTRACT(EPOCH FROM updated_at) FROM trade_log WHERE symbol=%s AND status='CLOSED' ORDER BY updated_at DESC LIMIT 1",
-                            (symbol,))
-                        row = cur.fetchone()
-                        if row and row[0] is not None and row[1] is not None:
-                            last_pnl = float(row[0])
-                            last_exit_ts = float(row[1])
+                # Cooldown progressivo de Stop Loss (base padrão de 2.0h se não configurado)
+                cooldown_base = COOLDOWN_HOURS if COOLDOWN_HOURS > 0 else 2.0
+                try:
+                    # Garante conexão ativa com o DB
+                    if self._db_conn is None or self._db_conn.closed != 0:
+                        import psycopg2
+                        self._db_conn = psycopg2.connect(os.getenv("DATABASE_URL", ""))
+                        self._db_conn.autocommit = True
+                        self._db_cursor = self._db_conn.cursor()
+                        
+                    cur = self._db_cursor
+                    cur.execute("""
+                        SELECT pnl_pct, EXTRACT(EPOCH FROM updated_at), exit_reason 
+                        FROM trade_log 
+                        WHERE symbol = %s AND status = 'CLOSED' 
+                        ORDER BY updated_at DESC LIMIT 10
+                    """, (symbol,))
+                    rows = cur.fetchall()
+                    
+                    if rows:
+                        consecutive_losses = 0
+                        last_exit_ts = None
+                        for r in rows:
+                            pnl = float(r[0]) if r[0] is not None else 0.0
+                            ts = float(r[1]) if r[1] is not None else 0.0
+                            reason = r[2]
+                            
+                            if last_exit_ts is None:
+                                last_exit_ts = ts
+                                
+                            if pnl < 0 or reason == 'STOP_LOSS':
+                                consecutive_losses += 1
+                            else:
+                                break
+                                
+                        if consecutive_losses > 0 and last_exit_ts is not None:
+                            # 1 loss = 2h (ou base), 2 loss = 4h (ou base * 2), 3 loss = 8h (ou base * 4)
+                            cooldown_h = cooldown_base * (2.0 ** (consecutive_losses - 1))
+                            cooldown_h = min(cooldown_h, 48.0) # limite máximo de 48h
+                            
                             elapsed = self._time.time() - last_exit_ts
-                            if elapsed < COOLDOWN_HOURS * 3600 and last_pnl <= 0:
-                                logger.info(f"  {symbol}: cooldown após loss ({elapsed/3600:.1f}h < {COOLDOWN_HOURS}h, saída às {elapsed/60:.0f}min atrás) → ignora")
+                            if elapsed < cooldown_h * 3600:
+                                logger.info(f"  {symbol}: cooldown progressivo ativo após {consecutive_losses} loss(es) ({elapsed/3600:.1f}h < {cooldown_h:.1f}h, saída há {elapsed/60:.0f}min) → ignora")
                                 continue
-                    except Exception:
-                        pass
+                except Exception as e:
+                    logger.error(f"Erro ao verificar cooldown progressivo para {symbol}: {e}")
+                    self._db_conn = None
+                    self._db_cursor = None
 
                 # 2. Decide a Rota Inicial (Futures vs Spot)
-                # SHORT sempre vai pra Futures; LONG segue lógica normal
+                # SHORT sempre vai pra Futures. LONG vai pra Futures apenas se FUTURES_ENABLED e atender ao par (score >= 0.95 & rsi < 30)
                 if is_short:
                     is_futures_route = True
                 else:
-                    is_futures_route = FUTURES_ENABLED and score >= FUTURES_MIN_SCORE
+                    is_futures_route = FUTURES_ENABLED and (score >= 0.95 and rsi < 30)
                 current_exchange = self.futures_exchange if is_futures_route else self.spot_exchange
 
                 # Se a rota inicial for Futures, fazemos a verificação preventiva de limite de posições e de saldo/margem livre
+                leverage = 1
                 if is_futures_route:
                     # Verifica limite de posições preventivamente
                     if active_futures >= FUTURES_MAX_POSITIONS:
+                        if is_short:
+                            logger.warning(f"  {symbol}: SHORT com limite de posições Futures atingido ({active_futures}/{FUTURES_MAX_POSITIONS}) → ignorando")
+                            continue
                         logger.warning(f"  [FALLBACK] Limite de posições Futures atingido ({active_futures}/{FUTURES_MAX_POSITIONS}). Desviando {symbol} para SPOT.")
                         is_futures_route = False
                         current_exchange = self.spot_exchange
                     else:
-                        if score >= 0.95:
-                            leverage = LEVERAGE_MAX
-                        elif score >= 0.90:
-                            leverage = LEVERAGE_HIGH
+                        # Calcular alavancagem com base no par (score & rsi)
+                        if is_short:
+                            # Para SHORT: alavancagem com RSI <= 70 (ótimo de acordo com shadow)
+                            if score >= 0.95 and rsi <= 70:
+                                if score >= 0.98:
+                                    leverage = 5
+                                elif score >= 0.97:
+                                    leverage = 3
+                                else:
+                                    leverage = 2
+                            else:
+                                leverage = 1
                         else:
-                            leverage = 2
+                            # Para LONG: alavancagem com RSI < 30
+                            if score >= 0.95 and rsi < 30:
+                                if score >= 0.98:
+                                    leverage = 5
+                                elif score >= 0.97:
+                                    leverage = 3
+                                else:
+                                    leverage = 2
+                            else:
+                                leverage = 1
 
-                        min_notional_f = 5.0
-                        try:
-                            min_notional_f = float(self.futures_exchange.market(symbol)["limits"]["cost"]["min"])
-                        except Exception:
-                            pass
-
-                        # 100% do saldo de Futures dividido por posições máximas
-                        candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
-                        
-                        # Garante que atende ao mínimo exigido pela moeda
-                        notional_per_trade = max(candidate_notional, min_notional_f)
-                        
-                        # Margem necessária para a posição
-                        margin_required = notional_per_trade / leverage
-                        
-                        # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
-                        if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
-                            if is_short:
-                                logger.warning(f"  {symbol}: SHORT sem saldo Futures (${futures_balance:.2f}) → ignorando (sem fallback pra Spot)")
-                                continue
-                            logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
+                        # Se der 1x leverage para LONG, desvia preventivamente para SPOT
+                        if not is_short and leverage == 1:
+                            logger.info(f"  {symbol}: score/rsi não qualifica para alavancagem LONG → Desviando para SPOT.")
                             is_futures_route = False
                             current_exchange = self.spot_exchange
-                        else:
-                            # Se passou nas validações, incrementamos preventivamente para a próxima oportunidade do mesmo loop
-                            active_futures += 1
+
+                # Se continuou na rota Futures, fazemos a verificação de saldo/margem livre
+                if is_futures_route:
+                    min_notional_f = 5.0
+                    try:
+                        min_notional_f = float(self.futures_exchange.market(symbol)["limits"]["cost"]["min"])
+                    except Exception:
+                        pass
+
+                    # 100% do saldo de Futures dividido por posições máximas
+                    candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
+                    
+                    # Garante que atende ao mínimo exigido pela moeda
+                    notional_per_trade = max(candidate_notional, min_notional_f)
+                    
+                    # Margem necessária para a posição
+                    margin_required = notional_per_trade / leverage
+                    
+                    # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
+                    if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
+                        if is_short:
+                            logger.warning(f"  {symbol}: SHORT sem saldo Futures (${futures_balance:.2f}) → ignorando (sem fallback pra Spot)")
+                            continue
+                        logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
+                        is_futures_route = False
+                        current_exchange = self.spot_exchange
+                        leverage = 1
+                    else:
+                        # Se passou nas validações, incrementamos preventivamente para a próxima oportunidade do mesmo loop
+                        active_futures += 1
 
                 try:
                     ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=50)
@@ -271,12 +332,9 @@ class TradeDecision:
                 current_tp_atr = TP_ATR_SHORT if is_short else TP_ATR_LONG
 
                 if is_futures_route:
-                    if is_short:
-                        leverage = 2
-                        if score >= 0.95: leverage = LEVERAGE_MAX
-                        elif score >= 0.90: leverage = LEVERAGE_HIGH
                     sl_price = 0.0
                 else:
+                    # Garantir leverage = 1 se for rota Spot
                     leverage = 1
                     exposed = spot_portfolio * RISK_PERCENT
                     candidate_notional = exposed / SPOT_MAX_POSITIONS if SPOT_MAX_POSITIONS > 0 else exposed
@@ -310,8 +368,9 @@ class TradeDecision:
                     sl_price = current_price + sl_dist  # SL acima na SHORT
                 else:
                     tp_price = current_price + tp_dist
+                    if is_futures_route:
+                        sl_price = current_price - sl_dist  # SL abaixo na Futures LONG
                     # Se for Spot, sl_price já foi calculado acima.
-                    # Se for Futures LONG, sl_price permanece 0.0.
 
                 # 5. Quantidade final formatada
                 position_size = notional_per_trade / current_price if current_price > 0 else 0
@@ -334,6 +393,7 @@ class TradeDecision:
                     "direction": direction,
                     "score": score,
                     "rsi": rsi,
+                    "market_regime": opp.get("market_regime", "neutral"),
                     "entry_price": current_price,
                     "quantity": position_size,
                     "sl_price": sl_price,
