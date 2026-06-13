@@ -78,6 +78,7 @@ class TradeDecision:
         self._time = time
         try:
             self._db_conn = psycopg2.connect(os.getenv("DATABASE_URL", ""))
+            self._db_conn.autocommit = True
             self._db_cursor = self._db_conn.cursor()
         except Exception:
             self._db_conn = None
