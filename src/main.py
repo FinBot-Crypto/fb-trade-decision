@@ -21,12 +21,13 @@ SL_ATR_LONG = float(os.getenv("SL_ATR_LONG", os.getenv("SL_ATR", "2.0")))
 TP_ATR_LONG = float(os.getenv("TP_ATR_LONG", os.getenv("TP_ATR", "4.0")))
 SL_ATR_SHORT = float(os.getenv("SL_ATR_SHORT", "4.0"))
 TP_ATR_SHORT = float(os.getenv("TP_ATR_SHORT", "4.0"))
+SHORT_MIN_RSI = float(os.getenv("SHORT_MIN_RSI", "75"))
 
 # Piso e Teto para SL e TP em percentual
 MIN_SL_PCT = float(os.getenv("MIN_SL_PCT", "0.01"))
 MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.03"))
 MIN_TP_PCT = float(os.getenv("MIN_TP_PCT", "0.02"))
-MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.06"))
+MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.30"))
 
 ATR_PERIOD = 14
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "20"))
@@ -250,8 +251,8 @@ class TradeDecision:
                     else:
                         # Calcular alavancagem com base no par (score & rsi)
                         if is_short:
-                            # Para SHORT: alavancagem com RSI <= 70 (ótimo de acordo com shadow)
-                            if score >= 0.95 and rsi <= 70:
+                            # Para SHORT: alavancagem com RSI >= SHORT_MIN_RSI (ótimo de acordo com a estratégia)
+                            if score >= 0.95 and rsi >= SHORT_MIN_RSI:
                                 if score >= 0.98:
                                     leverage = 5
                                 elif score >= 0.97:
