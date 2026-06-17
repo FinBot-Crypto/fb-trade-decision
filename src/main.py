@@ -360,17 +360,26 @@ class TradeDecision:
                 tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
                 tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
 
-                atr_sl_dist = current_sl_atr * atr
-                sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
-                sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
+                if current_sl_atr <= 0:
+                    sl_price = 0.0
+                else:
+                    atr_sl_dist = current_sl_atr * atr
+                    sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
+                    sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
 
                 if is_short:
                     tp_price = current_price - tp_dist
-                    sl_price = current_price + sl_dist  # SL acima na SHORT
+                    if current_sl_atr > 0:
+                        sl_price = current_price + sl_dist  # SL acima na SHORT
+                    else:
+                        sl_price = 0.0
                 else:
                     tp_price = current_price + tp_dist
                     if is_futures_route:
-                        sl_price = current_price - sl_dist  # SL abaixo na Futures LONG
+                        if current_sl_atr > 0:
+                            sl_price = current_price - sl_dist  # SL abaixo na Futures LONG
+                        else:
+                            sl_price = 0.0
                     # Se for Spot, sl_price já foi calculado acima.
 
                 # 5. Quantidade final formatada
