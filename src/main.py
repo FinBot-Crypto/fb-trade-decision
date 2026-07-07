@@ -116,15 +116,16 @@ class TradeDecision:
     async def get_futures_usdt_balance(self):
         try:
             balance = self.futures_exchange.fetch_balance()
-            return float(balance["USDT"]["free"])
+            usdt = balance.get("USDT", {})
+            return float(usdt.get("total", 0.0)), float(usdt.get("free", 0.0))
         except Exception as e:
             logger.error(f"Erro ao buscar balance USDT Futures: {e}")
-            return 0.0
+            return 0.0, 0.0
 
     async def get_total_spot_portfolio(self):
         try:
             balance = self.spot_exchange.fetch_balance()
-            total = float(balance["USDT"]["free"])
+            total = float(balance.get("USDT", {}).get("total", 0.0))
             for asset, amount in balance["total"].items():
                 if asset == "USDT" or amount <= 0:
                     continue
@@ -165,7 +166,7 @@ class TradeDecision:
 
             # 1. Busca saldos reais diretamente via API (segundo especificação do usuário)
             spot_balance = await self.get_spot_usdt_balance()
-            futures_balance = await self.get_futures_usdt_balance()
+            futures_balance, futures_free = await self.get_futures_usdt_balance()
             spot_portfolio = await self.get_total_spot_portfolio()
 
             # Conta quantidade de posições ativas de Futures
@@ -229,14 +230,14 @@ class TradeDecision:
                     self._db_conn = None
                     self._db_cursor = None
 
-                # 2. Decide a Rota Inicial (Futures vs Spot)
-                # SHORT sempre vai pra Futures. LONG vai pra Futures apenas se FUTURES_ENABLED e atender ao par (score >= 0.95 & rsi < 30)
+                 # 2. Decide a Rota Inicial (Futures vs Spot)
+                # SHORT sempre vai pra Futures. LONG vai pra Futures se FUTURES_ENABLED e score >= 0.70
                 if is_short:
                     is_futures_route = True
                 else:
-                    is_futures_route = FUTURES_ENABLED and (score >= 0.95 and rsi < 30)
+                    is_futures_route = FUTURES_ENABLED and (score >= 0.70)
                 current_exchange = self.futures_exchange if is_futures_route else self.spot_exchange
-
+ 
                 # Se a rota inicial for Futures, fazemos a verificação preventiva de limite de posições e de saldo/margem livre
                 leverage = 1
                 if is_futures_route:
@@ -262,17 +263,16 @@ class TradeDecision:
                             else:
                                 leverage = 1
                         else:
-                            # Para LONG: alavancagem com RSI < 30
-                            if score >= 0.95 and rsi < 30:
-                                if score >= 0.98:
-                                    leverage = 5
-                                elif score >= 0.97:
-                                    leverage = 3
-                                else:
-                                    leverage = 2
+                            # Para LONG: alavancagem escalada de 0.70 a 0.80
+                            if score >= 0.78:
+                                leverage = 5
+                            elif score >= 0.75:
+                                leverage = 3
+                            elif score >= 0.70:
+                                leverage = 2
                             else:
                                 leverage = 1
-
+ 
                         # Se der 1x leverage para LONG, desvia preventivamente para SPOT
                         if not is_short and leverage == 1:
                             logger.info(f"  {symbol}: score/rsi não qualifica para alavancagem LONG → Desviando para SPOT.")
@@ -286,6 +286,7 @@ class TradeDecision:
                         min_notional_f = float(self.futures_exchange.market(symbol)["limits"]["cost"]["min"])
                     except Exception:
                         pass
+                    min_notional_f = max(min_notional_f, 6.0)
 
                     # 100% do saldo de Futures dividido por posições máximas
                     candidate_notional = (futures_balance * leverage) / FUTURES_MAX_POSITIONS if FUTURES_MAX_POSITIONS > 0 else (futures_balance * leverage)
@@ -297,11 +298,11 @@ class TradeDecision:
                     margin_required = notional_per_trade / leverage
                     
                     # Se a margem requerida for maior que o saldo real livre, ou o saldo livre for ínfimo, desvia para Spot
-                    if margin_required > futures_balance * 0.98 or futures_balance <= 1.0:
+                    if margin_required > futures_free * 0.98 or futures_free <= 1.0:
                         if is_short:
-                            logger.warning(f"  {symbol}: SHORT sem saldo Futures (${futures_balance:.2f}) → ignorando (sem fallback pra Spot)")
+                            logger.warning(f"  {symbol}: SHORT sem saldo livre Futures (${futures_free:.2f} USDT, necessário ${margin_required:.2f} USDT) → ignorando (sem fallback pra Spot)")
                             continue
-                        logger.warning(f"  [FALLBACK] Saldo Futures insuficiente (${futures_balance:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
+                        logger.warning(f"  [FALLBACK] Saldo livre Futures insuficiente (${futures_free:.2f} USDT, necessário ${margin_required:.2f} USDT). Desviando {symbol} para SPOT.")
                         is_futures_route = False
                         current_exchange = self.spot_exchange
                         leverage = 1
@@ -328,60 +329,37 @@ class TradeDecision:
                     min_notional = float(current_exchange.market(symbol)["limits"]["cost"]["min"])
                 except Exception:
                     pass
+                min_notional = max(min_notional, 6.0)
 
-                # 4. Cálculo do Position Sizing final
-                current_sl_atr = SL_ATR_SHORT if is_short else SL_ATR_LONG
-                current_tp_atr = TP_ATR_SHORT if is_short else TP_ATR_LONG
-
-                if is_futures_route:
-                    sl_price = 0.0
+                # 4. Cálculo do Preço de Alvo (TP) e Stop Loss (SL) com base no Tier (Simetria 1:1)
+                tier = opp.get("tier", "Unknown")
+                if tier == "Major":
+                    pct = 0.008  # 0.8%
+                elif tier == "Strong Alt":
+                    pct = 0.010  # 1.0%
+                elif tier == "High Volatility":
+                    pct = 0.015  # 1.5%
                 else:
+                    pct = 0.010  # Fallback padrão de 1.0%
+
+                if is_short:
+                    tp_price = current_price * (1.0 - pct)
+                    sl_price = current_price * (1.0 + pct)
+                else:
+                    tp_price = current_price * (1.0 + pct)
+                    sl_price = current_price * (1.0 - pct)
+
+                if not is_futures_route:
                     # Garantir leverage = 1 se for rota Spot
                     leverage = 1
                     exposed = spot_portfolio * RISK_PERCENT
                     candidate_notional = exposed / SPOT_MAX_POSITIONS if SPOT_MAX_POSITIONS > 0 else exposed
 
-                    # SL dita o minimo para Spot (perna mais frágil do OCO)
-                    if current_sl_atr <= 0:
-                        sl_price = 0.0
-                        sl_min_notional = 0.0
-                    else:
-                        atr_sl_dist = current_sl_atr * atr
-                        sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
-                        sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
-                        sl_price = current_price - sl_dist
-                        sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
-                        sl_min_notional = sl_min_qty * current_price
+                    sl_min_qty = min_notional / sl_price if sl_price > 0 else 0
+                    sl_min_notional = sl_min_qty * current_price
 
                     notional_per_trade = max(candidate_notional, min_notional, sl_min_notional)
                     notional_per_trade = min(notional_per_trade, spot_balance * 0.98)
-
-                # Calcular preço de alvo (Take Profit) e Stop Loss
-                atr_tp_dist = current_tp_atr * atr
-                tp_dist = max(atr_tp_dist, current_price * MIN_TP_PCT)
-                tp_dist = min(tp_dist, current_price * MAX_TP_PCT)
-
-                if current_sl_atr <= 0:
-                    sl_price = 0.0
-                else:
-                    atr_sl_dist = current_sl_atr * atr
-                    sl_dist = max(atr_sl_dist, current_price * MIN_SL_PCT)
-                    sl_dist = min(sl_dist, current_price * MAX_SL_PCT)
-
-                if is_short:
-                    tp_price = current_price - tp_dist
-                    if current_sl_atr > 0:
-                        sl_price = current_price + sl_dist  # SL acima na SHORT
-                    else:
-                        sl_price = 0.0
-                else:
-                    tp_price = current_price + tp_dist
-                    if is_futures_route:
-                        if current_sl_atr > 0:
-                            sl_price = current_price - sl_dist  # SL abaixo na Futures LONG
-                        else:
-                            sl_price = 0.0
-                    # Se for Spot, sl_price já foi calculado acima.
 
                 # 5. Quantidade final formatada
                 position_size = notional_per_trade / current_price if current_price > 0 else 0
