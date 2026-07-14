@@ -42,29 +42,24 @@ LEVERAGE_HIGH = int(os.getenv("LEVERAGE_HIGH", "3"))
 LEVERAGE_MAX = int(os.getenv("LEVERAGE_MAX", "5"))
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "0"))  # 0 = desligado
 
+_PLACEHOLDER_KEYS = {"", "your_api_key", "your_api_secret"}
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+_api_key = BINANCE_API_KEY if BINANCE_API_KEY not in _PLACEHOLDER_KEYS else None
+_api_secret = BINANCE_API_SECRET if BINANCE_API_SECRET not in _PLACEHOLDER_KEYS else None
+
 
 
 class TradeDecision:
     def __init__(self):
         self.nc = None
         self.js = None
-        self.spot_exchange = ccxt.binance({
-            "apiKey": BINANCE_API_KEY,
-            "secret": BINANCE_API_SECRET,
-            "enableRateLimit": True,
-            "timeout": 15000,
-        })
-        self.futures_exchange = ccxt.binance({
-            "apiKey": BINANCE_API_KEY,
-            "secret": BINANCE_API_SECRET,
-            "enableRateLimit": True,
-            "timeout": 15000,
-            "options": {
-                "defaultType": "future"
-            }
-        })
+        _opts = {"enableRateLimit": True, "timeout": 15000}
+        if _api_key:
+            _opts["apiKey"] = _api_key
+            _opts["secret"] = _api_secret
+        self.spot_exchange = ccxt.binance({**_opts})
+        self.futures_exchange = ccxt.binance({**_opts, "options": {"defaultType": "future"}})
         # Compatibilidade
         self.exchange = self.spot_exchange
 
@@ -75,17 +70,44 @@ class TradeDecision:
         except Exception as e:
             logger.error(f"Erro ao inicializar mercados: {e}")
 
-        # Cooldown: evita reentrar na mesma moeda por X horas
+
         self.last_exit_time = {}  # symbol -> timestamp da última saída
         import time, psycopg2
         self._time = time
+        self.db_url = os.getenv("DATABASE_URL", "")
+        self.settings = {}
+        self.last_settings_update = 0
         try:
-            self._db_conn = psycopg2.connect(os.getenv("DATABASE_URL", ""))
+            self._db_conn = psycopg2.connect(self.db_url)
             self._db_conn.autocommit = True
             self._db_cursor = self._db_conn.cursor()
         except Exception:
             self._db_conn = None
             self._db_cursor = None
+
+    def get_settings(self):
+        import time, psycopg2
+        now = time.time()
+        if now - self.last_settings_update > 30 or not self.settings:
+            try:
+                conn = psycopg2.connect(self.db_url)
+                cur = conn.cursor()
+                cur.execute("SELECT key, value FROM bot_settings")
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+                for r in rows:
+                    val = r[1]
+                    if isinstance(val, str):
+                        try:
+                            val = json.loads(val)
+                        except:
+                            pass
+                    self.settings[r[0]] = val
+                self.last_settings_update = now
+                logger.info("Configurações do robô carregadas com sucesso.")
+            except Exception as e:
+                logger.error(f"Erro ao carregar configurações do banco no trade-decision: {e}")
 
     async def connect_nats(self):
         self.nc = await nats.connect(NATS_URL)
@@ -333,40 +355,26 @@ class TradeDecision:
                     pass
                 min_notional = max(min_notional, 6.0)
 
-                # 4. Cálculo do Preço de Alvo (TP) e Stop Loss (SL) com base no Tier e Direção (Otimizado)
+                self.get_settings()
+
+                # 4. Cálculo do Preço de Alvo (TP) e Stop Loss (SL) com base no Tier e Direção (Otimizado do Banco)
                 tier = opp.get("tier", "Unknown")
                 if is_short:
-                    if tier == "Major":
-                        sl_pct = 0.030  # 3.0%
-                        tp_pct = 0.020  # 2.0%
-                    elif tier == "Strong Alt":
-                        sl_pct = 0.050  # 5.0%
-                        tp_pct = 0.030  # 3.0%
-                    elif tier == "High Volatility":
-                        sl_pct = 0.060  # 6.0%
-                        tp_pct = 0.030  # 3.0%
-                    else:
-                        sl_pct = 0.050
-                        tp_pct = 0.030
+                    sl_key = f"short_{tier}_sl"
+                    tp_key = f"short_{tier}_tp"
+                    sl_val = float(self.settings.get(sl_key, 5.0)) / 100.0
+                    tp_val = float(self.settings.get(tp_key, 3.0)) / 100.0
 
-                    tp_price = current_price * (1.0 - tp_pct)
-                    sl_price = current_price * (1.0 + sl_pct)
+                    tp_price = current_price * (1.0 - tp_val)
+                    sl_price = current_price * (1.0 + sl_val)
                 else:
-                    if tier == "Major":
-                        sl_pct = 0.030  # 3.0%
-                        tp_pct = 0.030  # 3.0%
-                    elif tier == "Strong Alt":
-                        sl_pct = 0.030  # 3.0%
-                        tp_pct = 0.030  # 3.0%
-                    elif tier == "High Volatility":
-                        sl_pct = 0.050  # 5.0%
-                        tp_pct = 0.050  # 5.0%
-                    else:
-                        sl_pct = 0.030
-                        tp_pct = 0.030
+                    sl_key = f"long_{tier}_sl"
+                    tp_key = f"long_{tier}_tp"
+                    sl_val = float(self.settings.get(sl_key, 3.0)) / 100.0
+                    tp_val = float(self.settings.get(tp_key, 3.0)) / 100.0
 
-                    tp_price = current_price * (1.0 + tp_pct)
-                    sl_price = current_price * (1.0 - sl_pct)
+                    tp_price = current_price * (1.0 + tp_val)
+                    sl_price = current_price * (1.0 - sl_val)
 
                 if not is_futures_route:
                     # Garantir leverage = 1 se for rota Spot
