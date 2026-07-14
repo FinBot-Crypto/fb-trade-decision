@@ -333,23 +333,40 @@ class TradeDecision:
                     pass
                 min_notional = max(min_notional, 6.0)
 
-                # 4. Cálculo do Preço de Alvo (TP) e Stop Loss (SL) com base no Tier (Simetria 1:1)
+                # 4. Cálculo do Preço de Alvo (TP) e Stop Loss (SL) com base no Tier e Direção (Otimizado)
                 tier = opp.get("tier", "Unknown")
-                if tier == "Major":
-                    pct = 0.008  # 0.8%
-                elif tier == "Strong Alt":
-                    pct = 0.010  # 1.0%
-                elif tier == "High Volatility":
-                    pct = 0.015  # 1.5%
-                else:
-                    pct = 0.010  # Fallback padrão de 1.0%
-
                 if is_short:
-                    tp_price = current_price * (1.0 - pct)
-                    sl_price = current_price * (1.0 + pct)
+                    if tier == "Major":
+                        sl_pct = 0.030  # 3.0%
+                        tp_pct = 0.020  # 2.0%
+                    elif tier == "Strong Alt":
+                        sl_pct = 0.050  # 5.0%
+                        tp_pct = 0.030  # 3.0%
+                    elif tier == "High Volatility":
+                        sl_pct = 0.060  # 6.0%
+                        tp_pct = 0.030  # 3.0%
+                    else:
+                        sl_pct = 0.050
+                        tp_pct = 0.030
+
+                    tp_price = current_price * (1.0 - tp_pct)
+                    sl_price = current_price * (1.0 + sl_pct)
                 else:
-                    tp_price = current_price * (1.0 + pct)
-                    sl_price = current_price * (1.0 - pct)
+                    if tier == "Major":
+                        sl_pct = 0.030  # 3.0%
+                        tp_pct = 0.030  # 3.0%
+                    elif tier == "Strong Alt":
+                        sl_pct = 0.030  # 3.0%
+                        tp_pct = 0.030  # 3.0%
+                    elif tier == "High Volatility":
+                        sl_pct = 0.050  # 5.0%
+                        tp_pct = 0.050  # 5.0%
+                    else:
+                        sl_pct = 0.030
+                        tp_pct = 0.030
+
+                    tp_price = current_price * (1.0 + tp_pct)
+                    sl_price = current_price * (1.0 - sl_pct)
 
                 if not is_futures_route:
                     # Garantir leverage = 1 se for rota Spot
