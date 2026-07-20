@@ -274,32 +274,45 @@ class TradeDecision:
                         is_futures_route = False
                         current_exchange = self.spot_exchange
                     else:
-                        # Calcular alavancagem com base no par (score & rsi)
+                        # Calcular alavancagem com base nas faixas progressivas carregadas do banco por Tier
+                        tier = opp.get("tier", "Unknown")
+                        self.get_settings()
+                        
                         if is_short:
-                            # Para SHORT: alavancagem com RSI >= SHORT_MIN_RSI (ótimo de acordo com a estratégia)
-                            if score >= 0.95 and rsi >= SHORT_MIN_RSI:
-                                if score >= 0.98:
-                                    leverage = 5
-                                elif score >= 0.97:
-                                    leverage = 3
-                                else:
-                                    leverage = 2
+                            # Carrega gatilhos progressivos de SHORT
+                            min_score = float(self.settings.get(f"short_{tier}_min_score", 0.50))
+                            # Degraus progressivos: 5x se muito confiável, 3x se confiável, 2x intermediário
+                            t_5x = min_score + (1.0 - min_score) * 0.8  # Top 80% do range restante
+                            t_3x = min_score + (1.0 - min_score) * 0.5  # Top 50%
+                            t_2x = min_score + (1.0 - min_score) * 0.2  # Top 20%
+                            
+                            if score >= t_5x:
+                                leverage = 5
+                            elif score >= t_3x:
+                                leverage = 3
+                            elif score >= t_2x:
+                                leverage = 2
                             else:
                                 leverage = 1
                         else:
-                            # Para LONG: alavancagem escalada de 0.70 a 0.80
-                            if score >= 0.78:
+                            # Carrega gatilhos progressivos de LONG
+                            min_score = float(self.settings.get(f"long_{tier}_min_score", 0.60))
+                            t_5x = min_score + (1.0 - min_score) * 0.8
+                            t_3x = min_score + (1.0 - min_score) * 0.5
+                            t_2x = min_score + (1.0 - min_score) * 0.2
+                            
+                            if score >= t_5x:
                                 leverage = 5
-                            elif score >= 0.75:
+                            elif score >= t_3x:
                                 leverage = 3
-                            elif score >= 0.70:
+                            elif score >= t_2x:
                                 leverage = 2
                             else:
                                 leverage = 1
  
                         # Se der 1x leverage para LONG, desvia preventivamente para SPOT
                         if not is_short and leverage == 1:
-                            logger.info(f"  {symbol}: score/rsi não qualifica para alavancagem LONG → Desviando para SPOT.")
+                            logger.info(f"  {symbol}: score/rsi ({score:.2f}) não atingiu limite progressivo de alavancagem LONG ({t_2x:.2f}) → Desviando para SPOT.")
                             is_futures_route = False
                             current_exchange = self.spot_exchange
 
