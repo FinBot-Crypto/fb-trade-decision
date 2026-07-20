@@ -281,10 +281,15 @@ class TradeDecision:
                         if is_short:
                             # Carrega gatilhos progressivos de SHORT
                             min_score = float(self.settings.get(f"short_{tier}_min_score", 0.50))
-                            # Degraus progressivos: 5x se muito confiável, 3x se confiável, 2x intermediário
-                            t_5x = min_score + (1.0 - min_score) * 0.8  # Top 80% do range restante
-                            t_3x = min_score + (1.0 - min_score) * 0.5  # Top 50%
-                            t_2x = min_score + (1.0 - min_score) * 0.2  # Top 20%
+                            
+                            # Multiplicadores progressivos dinâmicos do banco
+                            pct_2x = float(self.settings.get(f"short_{tier}_lev_2x_pct", 0.20))
+                            pct_3x = float(self.settings.get(f"short_{tier}_lev_3x_pct", 0.50))
+                            pct_5x = float(self.settings.get(f"short_{tier}_lev_5x_pct", 0.80))
+                            
+                            t_5x = min_score + (1.0 - min_score) * pct_5x
+                            t_3x = min_score + (1.0 - min_score) * pct_3x
+                            t_2x = min_score + (1.0 - min_score) * pct_2x
                             
                             if score >= t_5x:
                                 leverage = 5
@@ -297,9 +302,14 @@ class TradeDecision:
                         else:
                             # Carrega gatilhos progressivos de LONG
                             min_score = float(self.settings.get(f"long_{tier}_min_score", 0.60))
-                            t_5x = min_score + (1.0 - min_score) * 0.8
-                            t_3x = min_score + (1.0 - min_score) * 0.5
-                            t_2x = min_score + (1.0 - min_score) * 0.2
+                            
+                            pct_2x = float(self.settings.get(f"long_{tier}_lev_2x_pct", 0.20))
+                            pct_3x = float(self.settings.get(f"long_{tier}_lev_3x_pct", 0.50))
+                            pct_5x = float(self.settings.get(f"long_{tier}_lev_5x_pct", 0.80))
+                            
+                            t_5x = min_score + (1.0 - min_score) * pct_5x
+                            t_3x = min_score + (1.0 - min_score) * pct_3x
+                            t_2x = min_score + (1.0 - min_score) * pct_2x
                             
                             if score >= t_5x:
                                 leverage = 5
